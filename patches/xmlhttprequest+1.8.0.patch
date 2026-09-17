@@ -1,0 +1,13 @@
+diff --git a/node_modules/xmlhttprequest/lib/XMLHttpRequest.js b/node_modules/xmlhttprequest/lib/XMLHttpRequest.js
+index 998ad33..e04dbb1 100644
+--- a/node_modules/xmlhttprequest/lib/XMLHttpRequest.js
++++ b/node_modules/xmlhttprequest/lib/XMLHttpRequest.js
+@@ -376,7 +376,7 @@ exports.XMLHttpRequest = function() {
+       path: uri,
+       method: settings.method,
+       headers: headers,
+-      agent: false,
++      agent: require("../../../out/api/proxyAgent").forUrl(settings.url) || false,
+       withCredentials: self.withCredentials
+     };
+ 

@@ -1,0 +1,7 @@
+.vscode/settings.json
+
+node_modules
+out
+*.vsix
+
+**/vendor/**
