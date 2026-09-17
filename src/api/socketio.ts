@@ -3,6 +3,7 @@ import { Identity, BaseAPI, ProjectMessageResponseSchema } from './base';
 import { FileEntity, DocumentEntity, FileRefEntity, FileType, FolderEntity, ProjectEntity } from '../core/remoteFileSystemProvider';
 import { EventBus } from '../utils/eventBus';
 import { SocketIOAlt } from './socketioAlt';
+import * as DiffMatchPatch from 'diff-match-patch';
 
 function decodePackedUtf8(text: string): string {
     return Buffer.from(text, 'latin1').toString('utf-8');
@@ -85,6 +86,10 @@ export class SocketIOAPI {
     private emit: any;
     /** Track the scheme used when the socket was last initialized */
     private _socketInitScheme?: ConnectionScheme;
+    /** Monotonically identifies the socket used by an in-flight request. */
+    private socketGeneration = 0;
+    /** Share one recovery between all requests that time out on the same socket. */
+    private documentRecovery?: Promise<void>;
 
     constructor(private url:string,
                 private readonly api:BaseAPI,
@@ -133,6 +138,7 @@ export class SocketIOAPI {
                 this.socket = this.api._initSocketV0(this.identity, query);
                 break;
         }
+        this.socketGeneration += 1;
         // create emit
         (this.socket.emit)[require('util').promisify.custom] = (event:string, ...args:any[]) => {
             const timeoutPromise = new Promise((_, reject) => {
@@ -400,19 +406,106 @@ export class SocketIOAPI {
         return {docLines, version, updates, ranges};
     }
 
+    private async recoverDocumentSocket() {
+        if (!this.documentRecovery) {
+            const recovery = (async () => {
+                await this.api.updateCookies(this.identity);
+                this.scheme = 'v2';
+                this.init();
+                await this.joinProject(this.projectId);
+            })();
+            this.documentRecovery = recovery;
+            recovery.finally(() => {
+                if (this.documentRecovery===recovery) {
+                    this.documentRecovery = undefined;
+                }
+            }).catch(() => {});
+        }
+        await this.documentRecovery;
+    }
+
     async joinDoc(docId:string) {
+        const requestGeneration = this.socketGeneration;
         try {
             return await this.joinDocOnce(docId);
         } catch (error) {
             if (String(error)!=='timeout') { throw error; }
             // A legacy Socket.IO connection can remain nominally connected while
             // document acknowledgements stop arriving. Refresh its short-lived
-            // cookie and replace it with a project-scoped v2 connection.
-            await this.api.updateCookies(this.identity);
-            this.scheme = 'v2';
-            this.init();
-            await this.joinProject(this.projectId);
+            // cookie and replace it with a project-scoped v2 connection. Requests
+            // that timed out on an already replaced socket simply retry on the
+            // current generation; concurrent timeouts share the same recovery.
+            if (requestGeneration===this.socketGeneration) {
+                await this.recoverDocumentSocket();
+            } else if (this.documentRecovery) {
+                await this.documentRecovery;
+            }
             return await this.joinDocOnce(docId);
+        }
+    }
+
+    /**
+     * Write one local-replica document through an isolated project-scoped
+     * connection. The editor socket is intentionally not reused: Overleaf's
+     * secondary Socket.IO cookie and document acknowledgements can expire while
+     * the main login remains valid.
+     */
+    async writeLocalReplicaDocument(docId:string, content:string) {
+        await this.api.updateCookies(this.identity);
+        const query = `?projectId=${this.projectId}&t=${Date.now()}`;
+        const socket = this.api._initSocketV0(this.identity, query);
+        const emit = (event:string, ...args:any[]) => new Promise<any[]>((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error(`${event} timeout`)), 15000);
+            socket.emit(event, ...args, (error:any, ...data:any[]) => {
+                clearTimeout(timer);
+                if (error) {
+                    reject(error instanceof Error ? error : new Error(String(error)));
+                } else {
+                    resolve(data);
+                }
+            });
+        });
+
+        try {
+            socket.on('error', () => {});
+            await new Promise<void>((resolve, reject) => {
+                const timer = setTimeout(() => reject(new Error('joinProjectResponse timeout')), 15000);
+                socket.on('joinProjectResponse', () => {
+                    clearTimeout(timer);
+                    resolve();
+                });
+                socket.on('connectionRejected', (error:any) => {
+                    clearTimeout(timer);
+                    reject(new Error(error?.message || 'connection rejected'));
+                });
+            });
+
+            const joined = await emit('joinDoc', docId, {encodeRanges:true});
+            const remoteContent = (joined[0] as string[]).map(line => decodePackedUtf8(line)).join('\n');
+            const version = joined[1] as number;
+            if (remoteContent===content) { return; }
+
+            const dmp = new DiffMatchPatch();
+            let currentPos = 0;
+            const op = dmp.diff_main(remoteContent, content).map(part => {
+                const incCount = part[0]===-1 ? 0 : part[1].length;
+                currentPos += incCount;
+                if (part[0]===0) { return undefined; }
+                return {
+                    p: currentPos-incCount,
+                    i: part[0]===1 ? part[1] : undefined,
+                    d: part[0]===-1 ? part[1] : undefined,
+                };
+            }).filter(update => update!==undefined);
+            const hash = require('crypto').createHash('sha1').update(
+                `blob ${content.length}\x00${content}`
+            ).digest('hex');
+            await emit('applyOtUpdate', docId, {doc:docId, v:version, hash, op});
+        } finally {
+            try {
+                socket.removeAllListeners();
+                socket.disconnect();
+            } catch {}
         }
     }
 

@@ -706,6 +706,28 @@ export class VirtualFileSystem extends vscode.Disposable {
         return true;
     }
 
+    /**
+     * Push an existing replica document over a short-lived collaboration
+     * connection. This keeps background synchronization independent from a
+     * stale editor socket while preserving the authenticated HTTP session.
+     */
+    async writeFileFromLocalReplica(uri: vscode.Uri, content:Uint8Array): Promise<boolean> {
+        if (!this.cachedRoot) { return false; }
+        const {fileType, fileEntity} = this._resolveUriFromRoot(uri, this.cachedRoot);
+        if (fileType!=='doc' || !fileEntity) { return false; }
+        await this.socket.writeLocalReplicaDocument(
+            fileEntity._id,
+            new TextDecoder().decode(content),
+        );
+        const doc = fileEntity as DocumentEntity;
+        doc.version = undefined;
+        doc.lastVersion = undefined;
+        doc.localCache = undefined;
+        doc.remoteCache = undefined;
+        this.notify([{type:vscode.FileChangeType.Changed, uri}]);
+        return true;
+    }
+
     async refreshLinkedFile(uri: vscode.Uri) {
         const {fileType, fileEntity} = await this._resolveUri(uri);
         if (fileType==='file' && fileEntity) {

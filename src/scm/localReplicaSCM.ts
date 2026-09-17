@@ -5,6 +5,7 @@ import { BaseSCM, CommitItem, SettingItem } from ".";
 import { VirtualFileSystem, parseUri } from '../core/remoteFileSystemProvider';
 
 const IGNORE_SETTING_KEY = 'ignore-patterns';
+const LOCAL_SYNC_STATE_FILE = '.overleaf/local-sync-state.json';
 
 type FileCache = {date:number, hash:number};
 
@@ -49,6 +50,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private initialReconcileDisposable?: vscode.Disposable;
     private lifecycleDisposable?: vscode.Disposable;
     private disposed = false;
+    /** Serialize local and remote operations so duplicate watcher events cannot
+     *  concurrently replace the shared collaboration socket. */
+    private syncQueue: Promise<void> = Promise.resolve();
+    private snapshotWriteQueue: Promise<void> = Promise.resolve();
     private ignorePatterns: string[] = [
         '**/.*',
         '**/.*/**',
@@ -355,7 +360,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private async applySync(action:'push'|'pull', type: 'update'|'delete', relPath:string, fromUri: vscode.Uri, toUri: vscode.Uri) {
         this.status = {status: action, message: `${type}: ${relPath}`};
 
-        await (async () => {
+        try {
             if (type==='delete') {
                 const newContent = undefined;
                 if (this.bypassSync(action, type, relPath, newContent)) { return; }
@@ -379,6 +384,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                 this.baseCache[relPath] = newContent;
                                 return;
                             }
+                            if (await this.vfs.writeFileFromLocalReplica(toUri, newContent)) {
+                                this.baseCache[relPath] = newContent;
+                                return;
+                            }
                             try {
                                 await vscode.workspace.fs.readFile(toUri);
                             } catch (error) {
@@ -393,16 +402,28 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         this.baseCache[relPath] = newContent;
                         if (action==='push') { await vscode.workspace.fs.readFile(toUri); } // update remote cache
                     } catch (error) {
-                        console.error(error);
+                        console.error(`Overleaf Workshop: ${action} failed for "${relPath}"`, error);
+                        throw error;
                     }
                 }
                 else {
                     console.error(`Unknown file type: ${stat.type}`);
                 }
             }
-        })();
+        } finally {
+            this.status = {status: 'idle', message: ''};
+        }
+    }
 
-        this.status = {status: 'idle', message: ''};
+    private enqueueSync(action:'push'|'pull', type: 'update'|'delete', relPath:string, fromUri: vscode.Uri, toUri: vscode.Uri) {
+        const work = this.syncQueue.then(async () => {
+            if (this.disposed) { return; }
+            await this.applySync(action, type, relPath, fromUri, toUri);
+        });
+        // Keep the queue usable after an individual operation fails. The caller
+        // still receives the original rejecting promise and can schedule a retry.
+        this.syncQueue = work.catch(() => {});
+        return work;
     }
 
     private async syncFromVFS(vfsUri: vscode.Uri, type: 'update'|'delete') {
@@ -410,7 +431,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         pathParts.at(-1)==='' && pathParts.pop(); // remove the last empty string
         const relPath = ('/' + pathParts.join('/'));
         const localUri = vscode.Uri.joinPath(this.baseUri, relPath);
-        return await this.applySync('pull', type, relPath, vfsUri, localUri);
+        return await this.enqueueSync('pull', type, relPath, vfsUri, localUri);
     }
 
     private async syncToVFS(localUri: vscode.Uri, type: 'update'|'delete') {
@@ -418,7 +439,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const basePath = this.baseUri.path;
         const relPath = localUri.path.slice(basePath.length);
         const vfsUri = this.vfs.pathToUri(relPath);
-        return await this.applySync('push', type, relPath, localUri, vfsUri);
+        return await this.enqueueSync('push', type, relPath, localUri, vfsUri);
     }
 
     /**
@@ -432,7 +453,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         // Only sync files within our baseUri (ensure path separator boundary)
         const basePath = this.baseUri.path.endsWith('/') ? this.baseUri.path : this.baseUri.path + '/';
         if (!docUri.path.startsWith(basePath)) { return; }
-        this.syncToVFS(docUri, 'update');
+        this.syncToVFS(docUri, 'update').catch(error => {
+            console.error(`Overleaf Workshop: saved document sync failed for "${docUri.fsPath}"`, error);
+        });
     }
 
     private async scanLocalFiles(): Promise<Map<string, {uri:vscode.Uri, signature:string}>> {
@@ -464,47 +487,77 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return files;
     }
 
+    private async loadLocalSnapshot(): Promise<Map<string, {uri:vscode.Uri, signature:string}>|undefined> {
+        try {
+            const stateUri = vscode.Uri.joinPath(this.baseUri, LOCAL_SYNC_STATE_FILE);
+            const raw = await vscode.workspace.fs.readFile(stateUri);
+            const state = JSON.parse(new TextDecoder().decode(raw)) as {files?:Record<string,string>};
+            const snapshot = new Map<string, {uri:vscode.Uri, signature:string}>();
+            for (const [relPath, signature] of Object.entries(state.files || {})) {
+                if (typeof signature==='string') {
+                    snapshot.set(relPath, {
+                        uri: vscode.Uri.file(require('path').join(this.baseUri.fsPath, relPath)),
+                        signature,
+                    });
+                }
+            }
+            return snapshot;
+        } catch {
+            return undefined;
+        }
+    }
+
+    private persistLocalSnapshot() {
+        const files = Object.fromEntries(
+            [...this.localSnapshot].map(([relPath, entry]) => [relPath, entry.signature])
+        );
+        const stateUri = vscode.Uri.joinPath(this.baseUri, LOCAL_SYNC_STATE_FILE);
+        const content = new TextEncoder().encode(JSON.stringify({version:1, files}, null, 2));
+        const write = async () => {
+            await vscode.workspace.fs.writeFile(stateUri, content);
+        };
+        this.snapshotWriteQueue = this.snapshotWriteQueue.then(write, write);
+        return this.snapshotWriteQueue;
+    }
+
     private async pollLocalChanges() {
         if (this.localPollRunning) { return; }
         this.localPollRunning = true;
         try {
             const current = await this.scanLocalFiles();
-            const previous = this.localSnapshot;
-            this.localSnapshot = current;
+            const previous = new Map(this.localSnapshot);
+            let snapshotChanged = false;
             for (const [relPath, entry] of current) {
                 if (previous.get(relPath)?.signature!==entry.signature) {
                     console.log(`Overleaf Workshop: detected local change "${relPath}"`);
-                    await this.syncToVFS(entry.uri, 'update');
+                    try {
+                        await this.syncToVFS(entry.uri, 'update');
+                        this.localSnapshot.set(relPath, entry);
+                        snapshotChanged = true;
+                    } catch (error) {
+                        // Leave the old signature in place so the next poll retries.
+                        console.error(`Overleaf Workshop: will retry local change "${relPath}"`, error);
+                    }
                 }
             }
             for (const [relPath, entry] of previous) {
                 if (!current.has(relPath)) {
-                    await this.syncToVFS(entry.uri, 'delete');
+                    try {
+                        await this.syncToVFS(entry.uri, 'delete');
+                        this.localSnapshot.delete(relPath);
+                        snapshotChanged = true;
+                    } catch (error) {
+                        console.error(`Overleaf Workshop: will retry local deletion "${relPath}"`, error);
+                    }
                 }
+            }
+            if (snapshotChanged) {
+                await this.persistLocalSnapshot();
             }
         } catch (error) {
             console.error('Overleaf Workshop: local polling failed', error);
         } finally {
             this.localPollRunning = false;
-        }
-    }
-
-    private async reconcileLocalFiles() {
-        try {
-            const files = await this.scanLocalFiles();
-            // Handle the newest local edits first. This restores the document the
-            // user was actively editing before replaying older replica files.
-            const entries = [...files.values()].sort((a, b) => {
-                const aMtime = Number(a.signature.split(':', 1)[0]);
-                const bMtime = Number(b.signature.split(':', 1)[0]);
-                return bMtime-aMtime;
-            });
-            for (const entry of entries) {
-                if (this.disposed) { return; }
-                await this.syncToVFS(entry.uri, 'update');
-            }
-        } catch (error) {
-            console.error('Overleaf Workshop: initial local reconciliation failed', error);
         }
     }
 
@@ -541,14 +594,22 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         this.saveListener = vscode.workspace.onDidSaveTextDocument(
             doc => this.onDocumentSaved(doc)
         );
-        this.localSnapshot = await this.scanLocalFiles();
+        const savedSnapshot = await this.loadLocalSnapshot();
+        this.localSnapshot = savedSnapshot || await this.scanLocalFiles();
+        if (!savedSnapshot) {
+            // The initial replica creation already performs its own merge. Seed a
+            // durable baseline here; later host restarts compare against it and
+            // replay only files changed while the extension was stopped.
+            await this.persistLocalSnapshot();
+        }
         console.log(`Overleaf Workshop: local polling started for "${this.baseUri.fsPath}" (${this.localSnapshot.size} files)`);
         this.localPollTimer = setInterval(() => this.pollLocalChanges(), 1500);
         this.localPollDisposable = new vscode.Disposable(() => {
             if (this.localPollTimer) { clearInterval(this.localPollTimer); }
         });
-        // Upload edits made while disconnected without delaying VFS connection.
-        this.initialReconcileTimer = setTimeout(() => this.reconcileLocalFiles(), 0);
+        // Compare the durable baseline immediately so edits made while the
+        // extension host was stopped are replayed without a full project scan.
+        this.initialReconcileTimer = setTimeout(() => this.pollLocalChanges(), 0);
         this.initialReconcileDisposable = new vscode.Disposable(() => {
             if (this.initialReconcileTimer) { clearTimeout(this.initialReconcileTimer); }
         });

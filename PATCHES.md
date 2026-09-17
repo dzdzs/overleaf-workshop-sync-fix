@@ -39,6 +39,14 @@ Base version: [`overleaf-workshop/overleaf-workshop` v0.15.10](https://github.co
   managers do not keep reporting a disconnected state.
 - Replace a nominally connected Socket.IO session when `joinDoc` stops
   acknowledging requests, refresh its short-lived cookie, and retry over v2.
+- Serialize local-replica events, retry failed file signatures, and share one
+  recovery across requests that time out on the same collaboration socket.
+- Push existing local-replica documents through an isolated project-scoped v2
+  connection that refreshes its short-lived cookie and disconnects after the OT
+  update, so background synchronization does not depend on a stale editor socket.
+- Persist successful local file signatures under `.overleaf` and compare them on
+  startup, replaying offline edits without opening every project document after
+  each extension-host restart.
 - Reconcile the most recently modified local files first and stop reconciliation
   tasks whose local-replica provider was replaced during a reconnect.
 - Avoid blocking connection setup on a full project replay, which can exceed
