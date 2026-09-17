@@ -27,6 +27,16 @@ Base version: [`overleaf-workshop/overleaf-workshop` v0.15.10](https://github.co
   extension host was stopped are uploaded after the next window reload.
 - Join a remote document before writing it. This initializes the version and
   text caches required to construct the Overleaf OT update.
+- Create remote documents for newly added local files instead of aborting when
+  the pre-write document join reports that the remote path does not exist.
+- Preserve the multipart boundary and content length when uploading new files
+  through `undici`, so Overleaf receives the `qqfile` form part.
+- Create new local-replica files through the authenticated HTTP API using the
+  last loaded file tree, without waiting for a reconnecting OT socket.
+- Await each replica operation during reconciliation to avoid flooding the
+  collaboration socket with concurrent document joins after reconnecting.
+- Dispose replaced collaboration status timers during reconnects so stale
+  managers do not keep reporting a disconnected state.
 - Avoid blocking connection setup on a full project replay, which can exceed
   the collaboration API timeout.
 

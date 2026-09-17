@@ -108,6 +108,8 @@ export function parseUri(uri: vscode.Uri) {
 
 export class VirtualFileSystem extends vscode.Disposable {
     private root?: ProjectEntity;
+    /** Last successfully loaded tree, retained while the collaboration socket reconnects. */
+    private cachedRoot?: ProjectEntity;
     private currentVersion?: number;
     private context: vscode.ExtensionContext;
     private api: BaseAPI;
@@ -266,6 +268,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
                 project.settings = (await this.api.getProjectSettings(identity, this.projectId)).settings!;
                 this.root = project;
+                this.cachedRoot = project;
                 const activeCondition = (vscode.workspace.workspaceFolders===undefined) || (vscode.workspace.workspaceFolders?.[0].uri.scheme!==ROOT_NAME) || (vscode.workspace.workspaceFolders?.[0].uri===this.origin);
                 // Register: [collaboration] ClientManager on Statusbar
                 if (activeCondition) {
@@ -319,25 +322,19 @@ export class VirtualFileSystem extends vscode.Disposable {
         this.socket.disconnect(); // jump to `onDisconnected` handler
     }
 
-    async _resolveUri(uri: vscode.Uri) {
-        // resolve path
-        const [parentFolder, fileName] = await (async () => {
-            const {pathParts} = parseUri(uri);
-            const root = await this.init();
-
-            let currentFolder = root.rootFolder[0];
-            for (let i = 0; i < pathParts.length-1; i++) {
-                const folderName = pathParts[i];
-                const folder = currentFolder.folders.find((folder) => folder.name === folderName);
-                if (folder) {
-                    currentFolder = folder;
-                } else {
-                    throw vscode.FileSystemError.FileNotFound(uri);
-                }
+    private _resolveUriFromRoot(uri: vscode.Uri, root: ProjectEntity) {
+        const {pathParts} = parseUri(uri);
+        let parentFolder = root.rootFolder[0];
+        for (let i = 0; i < pathParts.length-1; i++) {
+            const folderName = pathParts[i];
+            const folder = parentFolder.folders.find((folder) => folder.name === folderName);
+            if (folder) {
+                parentFolder = folder;
+            } else {
+                throw vscode.FileSystemError.FileNotFound(uri);
             }
-            const fileName = pathParts[pathParts.length-1];
-            return [currentFolder, fileName];
-        })();
+        }
+        const fileName = pathParts[pathParts.length-1];
         // resolve file
         const [fileEntity, fileType, fileId] = (() => {
             for (const _type of Object.keys(FolderKeys)) {
@@ -350,6 +347,10 @@ export class VirtualFileSystem extends vscode.Disposable {
             return [];
         })();
         return {parentFolder, fileName, fileEntity, fileType, fileId};
+    }
+
+    async _resolveUri(uri: vscode.Uri) {
+        return this._resolveUriFromRoot(uri, await this.init());
     }
 
     _resolveById(entityId: string, root?: FolderEntity, path?:string):{
@@ -654,8 +655,8 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
     }
 
-    async createFile(uri: vscode.Uri, content:Uint8Array, overwrite?:boolean) {
-        const {parentFolder, fileName, fileEntity} = await this._resolveUri(uri);
+    private async createFileAt(uri: vscode.Uri, content:Uint8Array, overwrite: boolean|undefined,
+                               parentFolder: FolderEntity, fileName: string, fileEntity?: FileEntity) {
         if (fileEntity && !overwrite) {
             throw vscode.FileSystemError.FileExists(uri);
         }
@@ -667,6 +668,8 @@ export class VirtualFileSystem extends vscode.Disposable {
             const _res = await this.api.addDoc(identity, this.projectId, parentFolder._id, fileName);
             if (_res.type==='success') {
                 res = _res.entity;
+            } else {
+                throw new Error(_res.message || vscode.l10n.t('Failed to create file'));
             }
         } else {
             const parentFolderId = parentFolder._id;
@@ -674,9 +677,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             if (_res.type==='success' && _res.entity!==undefined) {
                 res = _res.entity;
             } else {
-                if (_res.message!==undefined) {
-                    vscode.window.showErrorMessage(_res.message);
-                }
+                throw new Error(_res.message || vscode.l10n.t('Failed to upload file'));
             }
         }
         if (res && res._type) {
@@ -685,6 +686,24 @@ export class VirtualFileSystem extends vscode.Disposable {
                 {type: vscode.FileChangeType.Created, uri: uri},
             ]);
         }
+    }
+
+    async createFile(uri: vscode.Uri, content:Uint8Array, overwrite?:boolean) {
+        const {parentFolder, fileName, fileEntity} = await this._resolveUri(uri);
+        return this.createFileAt(uri, content, overwrite, parentFolder, fileName, fileEntity);
+    }
+
+    /**
+     * Create a file from a local replica without waiting for a reconnecting OT
+     * socket. The cached tree is sufficient to identify the parent folder, and
+     * the actual upload is performed by the authenticated HTTP API.
+     */
+    async createFileFromLocalReplica(uri: vscode.Uri, content:Uint8Array): Promise<boolean> {
+        if (!this.cachedRoot) { return false; }
+        const {parentFolder, fileName, fileEntity} = this._resolveUriFromRoot(uri, this.cachedRoot);
+        if (fileEntity) { return false; }
+        await this.createFileAt(uri, content, true, parentFolder, fileName, fileEntity);
+        return true;
     }
 
     async refreshLinkedFile(uri: vscode.Uri) {

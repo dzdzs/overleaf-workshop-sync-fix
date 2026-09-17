@@ -58,6 +58,8 @@ export class ClientManager {
     private readonly status: vscode.StatusBarItem;
     private readonly onlineUsers: {[K:string]:ExtendedUpdateUserSchema} = {};
     private connectedFlag: boolean = true;
+    private statusTimer?: NodeJS.Timeout;
+    private disposed = false;
     private readonly chatViewer: ChatViewProvider;
     /** Timestamp when connection was lost; used for grace period before clearing user list */
     private disconnectedAt: number = 0;
@@ -246,6 +248,7 @@ export class ClientManager {
     }
 
     private updateStatus() {
+        if (this.disposed) { return; }
         const count = Object.keys(this.onlineUsers).length;
         if (!this.connectedFlag) {
             const disconnectedDuration = Date.now() - this.disconnectedAt;
@@ -322,7 +325,7 @@ export class ClientManager {
         }
         
         this.status.show();
-        setTimeout(this.updateStatus.bind(this), 500);
+        this.statusTimer = setTimeout(this.updateStatus.bind(this), 500);
     }
 
     setStatusActive(clientId:string, timeout:number=10) {
@@ -380,7 +383,12 @@ export class ClientManager {
 
     get triggers() {
         return [
-            this.status,
+            new vscode.Disposable(() => {
+                this.disposed = true;
+                if (this.statusTimer) { clearTimeout(this.statusTimer); }
+                if (this.inactivateTask) { clearTimeout(this.inactivateTask); }
+                this.status.dispose();
+            }),
             // register commands
             vscode.commands.registerCommand(`${ROOT_NAME}.collaboration.insertText`, (text) => {
                 this.chatViewer.insertText(text);

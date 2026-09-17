@@ -373,7 +373,19 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         // A remote document must be joined before writeFile can build
                         // a versioned OT update. Initialize only the changed document.
                         if (action==='push') {
-                            await vscode.workspace.fs.readFile(toUri);
+                            if (await this.vfs.createFileFromLocalReplica(toUri, newContent)) {
+                                this.baseCache[relPath] = newContent;
+                                return;
+                            }
+                            try {
+                                await vscode.workspace.fs.readFile(toUri);
+                            } catch (error) {
+                                const fsError = error as vscode.FileSystemError;
+                                const isMissing = fsError?.code==='FileNotFound' || fsError?.name?.startsWith('EntryNotFound');
+                                if (!isMissing) { throw error; }
+                                // New local files do not exist remotely yet. writeFile
+                                // below will create them in the Overleaf project.
+                            }
                         }
                         await vscode.workspace.fs.writeFile(toUri, newContent);
                         this.baseCache[relPath] = newContent;
@@ -396,7 +408,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         pathParts.at(-1)==='' && pathParts.pop(); // remove the last empty string
         const relPath = ('/' + pathParts.join('/'));
         const localUri = vscode.Uri.joinPath(this.baseUri, relPath);
-        this.applySync('pull', type, relPath, vfsUri, localUri);
+        return await this.applySync('pull', type, relPath, vfsUri, localUri);
     }
 
     private async syncToVFS(localUri: vscode.Uri, type: 'update'|'delete') {
@@ -404,7 +416,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const basePath = this.baseUri.path;
         const relPath = localUri.path.slice(basePath.length);
         const vfsUri = this.vfs.pathToUri(relPath);
-        this.applySync('push', type, relPath, localUri, vfsUri);
+        return await this.applySync('push', type, relPath, localUri, vfsUri);
     }
 
     /**
