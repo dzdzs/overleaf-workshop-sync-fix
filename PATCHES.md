@@ -17,10 +17,14 @@ Base version: [`overleaf-workshop/overleaf-workshop` v0.15.10](https://github.co
   so a replica can live below the workspace root.
 - Recover a local replica association from `.overleaf/settings.json` when the
   extension's global SCM record is missing.
+- Match the settings URI to the active Overleaf project when one parent
+  workspace contains several local replicas.
 - Persist replica locations as normalized file URIs and correctly dispose their
   watchers during reconnects.
 - Detect files changed by terminals, Git, and coding agents with both the VS
   Code file watcher and a 1.5 second metadata poll.
+- Reconcile local files when the replica reconnects so edits made while the
+  extension host was stopped are uploaded after the next window reload.
 - Join a remote document before writing it. This initializes the version and
   text caches required to construct the Overleaf OT update.
 - Avoid blocking connection setup on a full project replay, which can exceed

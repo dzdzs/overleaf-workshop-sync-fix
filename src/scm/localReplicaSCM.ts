@@ -45,6 +45,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private localPollTimer?: NodeJS.Timeout;
     private localPollDisposable?: vscode.Disposable;
     private localPollRunning = false;
+    private initialReconcileTimer?: NodeJS.Timeout;
+    private initialReconcileDisposable?: vscode.Disposable;
     private ignorePatterns: string[] = [
         '**/.*',
         '**/.*/**',
@@ -173,18 +175,41 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return baseUri ? uri.path.slice(baseUri.path.length) : undefined;
     }
 
-    public static async readSettings(): Promise<any | undefined> {
+    public static async readSettings(expectedOrigin?: vscode.Uri): Promise<any | undefined> {
+        const readAt = async (settingUri: vscode.Uri) => {
+            try {
+                const content = await vscode.workspace.fs.readFile(settingUri);
+                const settings = JSON.parse( new TextDecoder().decode(content) );
+                settings._localReplicaBaseUri = vscode.Uri.file(require('path').dirname(require('path').dirname(settingUri.fsPath))).toString();
+                return settings;
+            } catch {
+                return undefined;
+            }
+        };
+        const matchesOrigin = (settings: any) => {
+            if (!expectedOrigin) { return true; }
+            try {
+                return vscode.Uri.parse(settings?.uri || '').toString()===expectedOrigin.toString();
+            } catch {
+                return false;
+            }
+        };
+
         const baseUri = await this.findReplicaBaseUri();
-        if (!baseUri) { return undefined; }
-        const settingUri = vscode.Uri.joinPath(baseUri, '.overleaf/settings.json');
-        try {
-            const content = await vscode.workspace.fs.readFile(settingUri);
-            const settings = JSON.parse( new TextDecoder().decode(content) );
-            settings._localReplicaBaseUri = baseUri.toString();
-            return settings;
-        } catch (error) {
-            return undefined;
+        if (baseUri) {
+            const settings = await readAt(vscode.Uri.joinPath(baseUri, '.overleaf/settings.json'));
+            if (settings && matchesOrigin(settings)) { return settings; }
         }
+
+        // Parent workspaces can contain several local Overleaf replicas.
+        try {
+            const settingUris = await vscode.workspace.findFiles('**/.overleaf/settings.json', '**/node_modules/**', 200);
+            for (const settingUri of settingUris) {
+                const settings = await readAt(settingUri);
+                if (settings && matchesOrigin(settings)) { return settings; }
+            }
+        } catch {}
+        return undefined;
     }
 
     private matchIgnorePatterns(path: string): boolean {
@@ -450,6 +475,17 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
     }
 
+    private async reconcileLocalFiles() {
+        try {
+            const files = await this.scanLocalFiles();
+            for (const entry of files.values()) {
+                await this.syncToVFS(entry.uri, 'update');
+            }
+        } catch (error) {
+            console.error('Overleaf Workshop: initial local reconciliation failed', error);
+        }
+    }
+
     private async initWatch() {
         // write ".overleaf/settings.json" if not exist
         const settingUri = vscode.Uri.joinPath(this.baseUri, '.overleaf/settings.json');
@@ -488,6 +524,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         this.localPollDisposable = new vscode.Disposable(() => {
             if (this.localPollTimer) { clearInterval(this.localPollTimer); }
         });
+        // Upload edits made while disconnected without delaying VFS connection.
+        this.initialReconcileTimer = setTimeout(() => this.reconcileLocalFiles(), 0);
+        this.initialReconcileDisposable = new vscode.Disposable(() => {
+            if (this.initialReconcileTimer) { clearTimeout(this.initialReconcileTimer); }
+        });
 
         return [
             // sync from vfs to local
@@ -501,6 +542,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             // include listeners for proper disposal
             this.saveListener,
             this.localPollDisposable,
+            this.initialReconcileDisposable,
         ];
     }
 

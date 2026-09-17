@@ -133,7 +133,7 @@ export class SCMCollectionProvider extends vscode.Disposable {
 
         // Recover a local replica when an older plugin version or a new login
         // lost the global SCM record but left the project settings in place.
-        const localSettings = await LocalReplicaSCMProvider.readSettings();
+        const localSettings = await LocalReplicaSCMProvider.readSettings(this.vfs.origin);
         const localBaseUri = localSettings?._localReplicaBaseUri ? vscode.Uri.parse(localSettings._localReplicaBaseUri) : undefined;
         const settingsUri = localSettings?.uri ? vscode.Uri.parse(localSettings.uri) : undefined;
         const matchesThisProject = settingsUri?.toString()===this.vfs.origin.toString();
