@@ -37,6 +37,10 @@ Base version: [`overleaf-workshop/overleaf-workshop` v0.15.10](https://github.co
   collaboration socket with concurrent document joins after reconnecting.
 - Dispose replaced collaboration status timers during reconnects so stale
   managers do not keep reporting a disconnected state.
+- Replace a nominally connected Socket.IO session when `joinDoc` stops
+  acknowledging requests, refresh its short-lived cookie, and retry over v2.
+- Reconcile the most recently modified local files first and stop reconciliation
+  tasks whose local-replica provider was replaced during a reconnect.
 - Avoid blocking connection setup on a full project replay, which can exceed
   the collaboration API timeout.
 

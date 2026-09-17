@@ -393,13 +393,27 @@ export class SocketIOAPI {
      * @param {string} docId - The document id.
      * @returns {Promise}
      */
+    private async joinDocOnce(docId:string) {
+        const returns = await this.emit('joinDoc', docId, { encodeRanges: true }) as [Array<string>, number, Array<any>, any];
+        const [docLinesAscii, version, updates, ranges] = returns;
+        const docLines = docLinesAscii.map((line) => decodePackedUtf8(line));
+        return {docLines, version, updates, ranges};
+    }
+
     async joinDoc(docId:string) {
-        return this.emit('joinDoc', docId, { encodeRanges: true })
-            .then((returns: [Array<string>, number, Array<any>, any]) => {
-                const [docLinesAscii, version, updates, ranges] = returns;
-                const docLines = docLinesAscii.map((line) => decodePackedUtf8(line));
-                return {docLines, version, updates, ranges};
-            });
+        try {
+            return await this.joinDocOnce(docId);
+        } catch (error) {
+            if (String(error)!=='timeout') { throw error; }
+            // A legacy Socket.IO connection can remain nominally connected while
+            // document acknowledgements stop arriving. Refresh its short-lived
+            // cookie and replace it with a project-scoped v2 connection.
+            await this.api.updateCookies(this.identity);
+            this.scheme = 'v2';
+            this.init();
+            await this.joinProject(this.projectId);
+            return await this.joinDocOnce(docId);
+        }
     }
 
     /**

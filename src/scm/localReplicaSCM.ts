@@ -47,6 +47,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private localPollRunning = false;
     private initialReconcileTimer?: NodeJS.Timeout;
     private initialReconcileDisposable?: vscode.Disposable;
+    private lifecycleDisposable?: vscode.Disposable;
+    private disposed = false;
     private ignorePatterns: string[] = [
         '**/.*',
         '**/.*/**',
@@ -490,7 +492,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private async reconcileLocalFiles() {
         try {
             const files = await this.scanLocalFiles();
-            for (const entry of files.values()) {
+            // Handle the newest local edits first. This restores the document the
+            // user was actively editing before replaying older replica files.
+            const entries = [...files.values()].sort((a, b) => {
+                const aMtime = Number(a.signature.split(':', 1)[0]);
+                const bMtime = Number(b.signature.split(':', 1)[0]);
+                return bMtime-aMtime;
+            });
+            for (const entry of entries) {
+                if (this.disposed) { return; }
                 await this.syncToVFS(entry.uri, 'update');
             }
         } catch (error) {
@@ -499,6 +509,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     }
 
     private async initWatch() {
+        this.disposed = false;
         // write ".overleaf/settings.json" if not exist
         const settingUri = vscode.Uri.joinPath(this.baseUri, '.overleaf/settings.json');
         try {
@@ -541,6 +552,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         this.initialReconcileDisposable = new vscode.Disposable(() => {
             if (this.initialReconcileTimer) { clearTimeout(this.initialReconcileTimer); }
         });
+        this.lifecycleDisposable = new vscode.Disposable(() => {
+            this.disposed = true;
+        });
 
         return [
             // sync from vfs to local
@@ -555,6 +569,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             this.saveListener,
             this.localPollDisposable,
             this.initialReconcileDisposable,
+            this.lifecycleDisposable,
         ];
     }
 
