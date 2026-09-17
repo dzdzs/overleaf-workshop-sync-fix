@@ -369,7 +369,20 @@ export class SocketIOAPI {
                         reject(err.message);
                     });
                 });
-                return Promise.race([joinPromise, rejectPromise, timeoutPromise]);
+                return Promise.race([joinPromise, rejectPromise, timeoutPromise]).catch(err => {
+                    // The current Overleaf service can leave the legacy v1
+                    // joinProject request unanswered instead of rejecting it. Switch
+                    // to the project-scoped v2 socket immediately on that timeout.
+                    if (this.scheme==='v1' && err==='timeout') {
+                        console.log('SocketIOAPI: v1 join timed out, switching to v2');
+                        return this.api.updateCookies(this.identity).then(() => {
+                            this.scheme = 'v2';
+                            this.init();
+                            return this.joinProject(project_id);
+                        });
+                    }
+                    return Promise.reject(err);
+                });
             case 'v2':
                 return Promise.race([this.record!, timeoutPromise]);
         }

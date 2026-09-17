@@ -9,6 +9,10 @@ Base version: [`overleaf-workshop/overleaf-workshop` v0.15.10](https://github.co
 - Route legacy Socket.IO handshake and WebSocket traffic through the same proxy
   environment using `http-proxy-agent`, `https-proxy-agent`, and
   `proxy-from-env`.
+- Refresh and replace Overleaf's short-lived Socket.IO cookie when the legacy
+  v1 join request times out, then reconnect through the project-scoped v2
+  endpoint. The long-lived login session can remain valid after this secondary
+  cookie expires.
 - Find `.overleaf/settings.json` by walking upward from the active LaTeX file,
   so a replica can live below the workspace root.
 - Recover a local replica association from `.overleaf/settings.json` when the

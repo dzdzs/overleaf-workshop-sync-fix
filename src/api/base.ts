@@ -339,7 +339,11 @@ export class BaseAPI {
         });
         const cookies = getSetCookie(res)[0]?.split(';')[0];
         if (cookies) {
-            identity.cookies = `${identity.cookies}; ${cookies}`;
+            const cookieName = cookies.split('=', 1)[0];
+            const existing = identity.cookies.split(';')
+                .map(cookie => cookie.trim())
+                .filter(cookie => cookie && cookie.split('=', 1)[0]!==cookieName);
+            identity.cookies = [...existing, cookies].join('; ');
         }
         return identity;
     };
