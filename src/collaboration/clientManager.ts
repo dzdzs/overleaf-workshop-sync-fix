@@ -170,6 +170,11 @@ export class ClientManager {
 
     private async updatePosition(clientId:string, docId: string, row: number, column: number, details?:UpdateUserSchema) {
         if (clientId === this.publicId) { return; }
+        // A collaborator can briefly report an incomplete or stale cursor
+        // position while switching documents. VS Code rejects negative or
+        // non-integer positions when constructing a Range; ignore only that
+        // presence update so it cannot surface as an unrelated sync error.
+        if (!Number.isInteger(row) || row < 0 || !Number.isInteger(column) || column < 0) { return; }
 
         // update record
         if (this.onlineUsers[clientId]===undefined) {

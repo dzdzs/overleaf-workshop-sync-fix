@@ -451,10 +451,7 @@ export class SocketIOAPI {
      * the main login remains valid.
      */
     async writeLocalReplicaDocument(docId:string, content:string) {
-        await this.api.updateCookies(this.identity);
-        const query = `?projectId=${this.projectId}&t=${Date.now()}`;
-        const socket = this.api._initSocketV0(this.identity, query);
-        const emit = (event:string, ...args:any[]) => new Promise<any[]>((resolve, reject) => {
+        const emit = (socket:any, event:string, ...args:any[]) => new Promise<any[]>((resolve, reject) => {
             const timer = setTimeout(() => reject(new Error(`${event} timeout`)), 15000);
             socket.emit(event, ...args, (error:any, ...data:any[]) => {
                 clearTimeout(timer);
@@ -465,8 +462,10 @@ export class SocketIOAPI {
                 }
             });
         });
-
-        try {
+        const openIsolatedProjectSocket = async () => {
+            await this.api.updateCookies(this.identity);
+            const query = `?projectId=${this.projectId}&t=${Date.now()}`;
+            const socket = this.api._initSocketV0(this.identity, query);
             socket.on('error', () => {});
             await new Promise<void>((resolve, reject) => {
                 const timer = setTimeout(() => reject(new Error('joinProjectResponse timeout')), 15000);
@@ -479,8 +478,13 @@ export class SocketIOAPI {
                     reject(new Error(error?.message || 'connection rejected'));
                 });
             });
+            return socket;
+        };
+        const socket = await openIsolatedProjectSocket();
+        let verificationSocket:any;
 
-            const joined = await emit('joinDoc', docId, {encodeRanges:true});
+        try {
+            const joined = await emit(socket, 'joinDoc', docId, {encodeRanges:true});
             const remoteContent = (joined[0] as string[]).map(line => decodePackedUtf8(line)).join('\n');
             const version = joined[1] as number;
             if (remoteContent===content) { return; }
@@ -506,28 +510,25 @@ export class SocketIOAPI {
                 // string length used by its text OT model.
                 `blob ${content.length}\x00${content}`
             ).digest('hex');
-            await emit('applyOtUpdate', docId, {doc:docId, v:version, hash, op});
+            await emit(socket, 'applyOtUpdate', docId, {doc:docId, v:version, hash, op});
 
-            // An acknowledgement alone is insufficient: some collaboration
-            // failures are reported asynchronously. Rejoin the document and
-            // verify the committed text before advancing the replica snapshot.
-            let committed = false;
-            for (let attempt=0; attempt<3 && !committed; attempt++) {
-                await emit('leaveDoc', docId);
-                await new Promise(resolve => setTimeout(resolve, 250*(attempt+1)));
-                const verified = await emit('joinDoc', docId, {encodeRanges:true});
-                const verifiedContent = (verified[0] as string[])
-                    .map(line => decodePackedUtf8(line)).join('\n');
-                committed = verifiedContent===content;
-            }
-            if (!committed) {
+            // Rejoining on the writing socket can return its optimistic local OT
+            // state even if the server never persisted the update. Verify through
+            // a new project-scoped connection before advancing the replica state.
+            verificationSocket = await openIsolatedProjectSocket();
+            const verified = await emit(verificationSocket, 'joinDoc', docId, {encodeRanges:true});
+            const verifiedContent = (verified[0] as string[])
+                .map(line => decodePackedUtf8(line)).join('\n');
+            if (verifiedContent!==content) {
                 throw new Error('Overleaf rejected or did not commit the document update');
             }
         } finally {
-            try {
-                socket.removeAllListeners();
-                socket.disconnect();
-            } catch {}
+            for (const currentSocket of [socket, verificationSocket]) {
+                try {
+                    currentSocket?.removeAllListeners();
+                    currentSocket?.disconnect();
+                } catch {}
+            }
         }
     }
 
