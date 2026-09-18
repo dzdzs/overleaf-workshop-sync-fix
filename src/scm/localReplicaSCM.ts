@@ -54,6 +54,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
      *  concurrently replace the shared collaboration socket. */
     private syncQueue: Promise<void> = Promise.resolve();
     private snapshotWriteQueue: Promise<void> = Promise.resolve();
+    private activePushes: Map<string, number> = new Map();
+    private failedPushes: Set<string> = new Set();
     private ignorePatterns: string[] = [
         '**/.*',
         '**/.*/**',
@@ -402,6 +404,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         this.baseCache[relPath] = newContent;
                         if (action==='push') { await vscode.workspace.fs.readFile(toUri); } // update remote cache
                     } catch (error) {
+                        // The propagation cache is only valid after a completed
+                        // write. Keeping it after a failure makes the next poll
+                        // mistake an unsent file for an already synced duplicate.
+                        this.bypassCache.delete(relPath);
                         console.error(`Overleaf Workshop: ${action} failed for "${relPath}"`, error);
                         throw error;
                     }
@@ -430,6 +436,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const {pathParts} = parseUri(vfsUri);
         pathParts.at(-1)==='' && pathParts.pop(); // remove the last empty string
         const relPath = ('/' + pathParts.join('/'));
+        if ((this.activePushes.get(relPath) || 0)>0 || this.failedPushes.has(relPath)) {
+            console.log(`Overleaf Workshop: deferred remote pull while local push is pending "${relPath}"`);
+            return;
+        }
         const localUri = vscode.Uri.joinPath(this.baseUri, relPath);
         return await this.enqueueSync('pull', type, relPath, vfsUri, localUri);
     }
@@ -439,7 +449,22 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const basePath = this.baseUri.path;
         const relPath = localUri.path.slice(basePath.length);
         const vfsUri = this.vfs.pathToUri(relPath);
-        return await this.enqueueSync('push', type, relPath, localUri, vfsUri);
+        this.activePushes.set(relPath, (this.activePushes.get(relPath) || 0)+1);
+        try {
+            const result = await this.enqueueSync('push', type, relPath, localUri, vfsUri);
+            this.failedPushes.delete(relPath);
+            return result;
+        } catch (error) {
+            this.failedPushes.add(relPath);
+            throw error;
+        } finally {
+            const remaining = (this.activePushes.get(relPath) || 1)-1;
+            if (remaining===0) {
+                this.activePushes.delete(relPath);
+            } else {
+                this.activePushes.set(relPath, remaining);
+            }
+        }
     }
 
     /**

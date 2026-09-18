@@ -488,6 +488,10 @@ export class SocketIOAPI {
             const dmp = new DiffMatchPatch();
             let currentPos = 0;
             const op = dmp.diff_main(remoteContent, content).map(part => {
+                // diff-match-patch can emit empty edit components around
+                // Unicode boundaries. ShareJS rejects {i:""} and {d:""} as
+                // invalid OT arguments.
+                if (part[1].length===0) { return undefined; }
                 const incCount = part[0]===-1 ? 0 : part[1].length;
                 currentPos += incCount;
                 if (part[0]===0) { return undefined; }
@@ -498,9 +502,27 @@ export class SocketIOAPI {
                 };
             }).filter(update => update!==undefined);
             const hash = require('crypto').createHash('sha1').update(
+                // Overleaf's ShareJS compatibility layer hashes the JavaScript
+                // string length used by its text OT model.
                 `blob ${content.length}\x00${content}`
             ).digest('hex');
             await emit('applyOtUpdate', docId, {doc:docId, v:version, hash, op});
+
+            // An acknowledgement alone is insufficient: some collaboration
+            // failures are reported asynchronously. Rejoin the document and
+            // verify the committed text before advancing the replica snapshot.
+            let committed = false;
+            for (let attempt=0; attempt<3 && !committed; attempt++) {
+                await emit('leaveDoc', docId);
+                await new Promise(resolve => setTimeout(resolve, 250*(attempt+1)));
+                const verified = await emit('joinDoc', docId, {encodeRanges:true});
+                const verifiedContent = (verified[0] as string[])
+                    .map(line => decodePackedUtf8(line)).join('\n');
+                committed = verifiedContent===content;
+            }
+            if (!committed) {
+                throw new Error('Overleaf rejected or did not commit the document update');
+            }
         } finally {
             try {
                 socket.removeAllListeners();
