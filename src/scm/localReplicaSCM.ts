@@ -345,10 +345,18 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         });
     }
 
-    private bypassSync(action:'push'|'pull', type:'update'|'delete', relPath: string, content?: Uint8Array): boolean {
+    private bypassSync(action:'push'|'pull', type:'update'|'delete', relPath: string, content?: Uint8Array, force=false): boolean {
         // bypass ignore files
         if (this.matchIgnorePatterns(relPath)) {
             return true;
+        }
+        // Durable polling is the final authority for a changed local signature.
+        // A watcher may already have populated the propagation cache without a
+        // confirmed write, so a polling retry must not be skipped as a duplicate.
+        if (force) {
+            this.setBypassCache(relPath, content, action);
+            console.log(`${new Date().toLocaleString()} [${action}] ${type} "${relPath}" (forced verification)`);
+            return false;
         }
         // synchronization propagation check
         if (!this.shouldPropagate(action, relPath, content)) {
@@ -359,26 +367,26 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return false;
     }
 
-    private async applySync(action:'push'|'pull', type: 'update'|'delete', relPath:string, fromUri: vscode.Uri, toUri: vscode.Uri) {
+    private async applySync(action:'push'|'pull', type: 'update'|'delete', relPath:string, fromUri: vscode.Uri, toUri: vscode.Uri, force=false) {
         this.status = {status: action, message: `${type}: ${relPath}`};
 
         try {
             if (type==='delete') {
                 const newContent = undefined;
-                if (this.bypassSync(action, type, relPath, newContent)) { return; }
+                if (this.bypassSync(action, type, relPath, newContent, force)) { return; }
                 delete this.baseCache[relPath];
                 await vscode.workspace.fs.delete(toUri, {recursive:true});
             } else {
                 const stat = await vscode.workspace.fs.stat(fromUri);
                 if (stat.type===vscode.FileType.Directory) {
                     const newContent = new Uint8Array();
-                    if (this.bypassSync(action, type, relPath, newContent)) { return; }
+                    if (this.bypassSync(action, type, relPath, newContent, force)) { return; }
                     await vscode.workspace.fs.createDirectory(toUri);
                 }
                 else if (stat.type===vscode.FileType.File) {
                     try {
                         const newContent = await vscode.workspace.fs.readFile(fromUri);
-                        if (this.bypassSync(action, type, relPath, newContent)) { return; }
+                        if (this.bypassSync(action, type, relPath, newContent, force)) { return; }
                         // A remote document must be joined before writeFile can build
                         // a versioned OT update. Initialize only the changed document.
                         if (action==='push') {
@@ -421,10 +429,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
     }
 
-    private enqueueSync(action:'push'|'pull', type: 'update'|'delete', relPath:string, fromUri: vscode.Uri, toUri: vscode.Uri) {
+    private enqueueSync(action:'push'|'pull', type: 'update'|'delete', relPath:string, fromUri: vscode.Uri, toUri: vscode.Uri, force=false) {
         const work = this.syncQueue.then(async () => {
             if (this.disposed) { return; }
-            await this.applySync(action, type, relPath, fromUri, toUri);
+            await this.applySync(action, type, relPath, fromUri, toUri, force);
         });
         // Keep the queue usable after an individual operation fails. The caller
         // still receives the original rejecting promise and can schedule a retry.
@@ -444,14 +452,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return await this.enqueueSync('pull', type, relPath, vfsUri, localUri);
     }
 
-    private async syncToVFS(localUri: vscode.Uri, type: 'update'|'delete') {
+    private async syncToVFS(localUri: vscode.Uri, type: 'update'|'delete', force=false) {
         // get relative path to baseUri
         const basePath = this.baseUri.path;
         const relPath = localUri.path.slice(basePath.length);
         const vfsUri = this.vfs.pathToUri(relPath);
         this.activePushes.set(relPath, (this.activePushes.get(relPath) || 0)+1);
         try {
-            const result = await this.enqueueSync('push', type, relPath, localUri, vfsUri);
+            const result = await this.enqueueSync('push', type, relPath, localUri, vfsUri, force);
             this.failedPushes.delete(relPath);
             return result;
         } catch (error) {
@@ -556,7 +564,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 if (previous.get(relPath)?.signature!==entry.signature) {
                     console.log(`Overleaf Workshop: detected local change "${relPath}"`);
                     try {
-                        await this.syncToVFS(entry.uri, 'update');
+                        await this.syncToVFS(entry.uri, 'update', true);
                         this.localSnapshot.set(relPath, entry);
                         snapshotChanged = true;
                     } catch (error) {
@@ -568,7 +576,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             for (const [relPath, entry] of previous) {
                 if (!current.has(relPath)) {
                     try {
-                        await this.syncToVFS(entry.uri, 'delete');
+                        await this.syncToVFS(entry.uri, 'delete', true);
                         this.localSnapshot.delete(relPath);
                         snapshotChanged = true;
                     } catch (error) {

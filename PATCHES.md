@@ -51,6 +51,8 @@ Base version: [`overleaf-workshop/overleaf-workshop` v0.15.10](https://github.co
   fresh collaboration connection before recording success.
 - Preserve failed changes for polling retries and defer remote pulls while a local
   push is pending, preventing a rejected OT update from overwriting the local edit.
+- Force durable polling changes through a real remote write and fresh verification,
+  even when an earlier watcher event populated the propagation cache.
 - Reconcile the most recently modified local files first and stop reconciliation
   tasks whose local-replica provider was replaced during a reconnect.
 - Avoid blocking connection setup on a full project replay, which can exceed
