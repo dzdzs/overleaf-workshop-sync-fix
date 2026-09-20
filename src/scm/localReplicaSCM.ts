@@ -56,6 +56,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private snapshotWriteQueue: Promise<void> = Promise.resolve();
     private activePushes: Map<string, number> = new Map();
     private failedPushes: Set<string> = new Set();
+    /** Remote change notifications skipped while a local push held the path,
+     *  replayed once that push settles so the edit is not silently lost. */
+    private deferredPulls: Map<string, {vfsUri: vscode.Uri, type: 'update'|'delete'}> = new Map();
     private ignorePatterns: string[] = [
         '**/.*',
         '**/.*/**',
@@ -446,10 +449,25 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const relPath = ('/' + pathParts.join('/'));
         if ((this.activePushes.get(relPath) || 0)>0 || this.failedPushes.has(relPath)) {
             console.log(`Overleaf Workshop: deferred remote pull while local push is pending "${relPath}"`);
+            // Keep the latest notification so it can be replayed once the
+            // pending push settles, instead of dropping the remote edit.
+            this.deferredPulls.set(relPath, {vfsUri, type});
             return;
         }
         const localUri = vscode.Uri.joinPath(this.baseUri, relPath);
         return await this.enqueueSync('pull', type, relPath, vfsUri, localUri);
+    }
+
+    /** Replay a remote change that arrived while a push held this path, now
+     *  that the push has settled. Re-reads the current remote content rather
+     *  than trusting the deferred event, since more changes may have landed. */
+    private replayDeferredPull(relPath: string) {
+        const deferred = this.deferredPulls.get(relPath);
+        if (!deferred) { return; }
+        this.deferredPulls.delete(relPath);
+        this.syncFromVFS(deferred.vfsUri, deferred.type).catch(error => {
+            console.error(`Overleaf Workshop: replay of deferred pull failed for "${relPath}"`, error);
+        });
     }
 
     private async syncToVFS(localUri: vscode.Uri, type: 'update'|'delete', force=false) {
@@ -469,6 +487,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             const remaining = (this.activePushes.get(relPath) || 1)-1;
             if (remaining===0) {
                 this.activePushes.delete(relPath);
+                // Only replay once the path is fully clear: a failed push
+                // keeps deferring pulls until a retry actually succeeds.
+                if (!this.failedPushes.has(relPath)) {
+                    this.replayDeferredPull(relPath);
+                }
             } else {
                 this.activePushes.set(relPath, remaining);
             }

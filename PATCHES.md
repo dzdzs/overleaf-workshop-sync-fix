@@ -57,6 +57,11 @@ Base version: [`overleaf-workshop/overleaf-workshop` v0.15.10](https://github.co
   tasks whose local-replica provider was replaced during a reconnect.
 - Avoid blocking connection setup on a full project replay, which can exceed
   the collaboration API timeout.
+- Replay a remote change notification skipped while a local push held its
+  path, once that push settles, instead of dropping it. Previously a pending
+  or failed local push silently discarded any concurrent Overleaf edit to the
+  same file, so it never reached the local replica or the next push's base
+  content.
 
 ## Build
 
