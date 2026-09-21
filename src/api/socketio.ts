@@ -450,7 +450,7 @@ export class SocketIOAPI {
      * secondary Socket.IO cookie and document acknowledgements can expire while
      * the main login remains valid.
      */
-    async writeLocalReplicaDocument(docId:string, content:string) {
+    async writeLocalReplicaDocument(docId:string, content:string, baseContent?:string): Promise<string> {
         const emit = (socket:any, event:string, ...args:any[]) => new Promise<any[]>((resolve, reject) => {
             const timer = setTimeout(() => reject(new Error(`${event} timeout`)), 15000);
             socket.emit(event, ...args, (error:any, ...data:any[]) => {
@@ -487,11 +487,23 @@ export class SocketIOAPI {
             const joined = await emit(socket, 'joinDoc', docId, {encodeRanges:true});
             const remoteContent = (joined[0] as string[]).map(line => decodePackedUtf8(line)).join('\n');
             const version = joined[1] as number;
-            if (remoteContent===content) { return; }
+            if (remoteContent===content) { return remoteContent; }
 
             const dmp = new DiffMatchPatch();
+            // A blind diff(remoteContent, content) treats every remote-only
+            // change since the local edit's base snapshot as noise to delete.
+            // When the remote has moved on from that base, replay only the
+            // local delta onto the current remote text instead of overwriting it.
+            let targetContent = content;
+            if (baseContent!==undefined && baseContent!==remoteContent) {
+                const localPatches = dmp.patch_make(baseContent, content);
+                const [merged] = dmp.patch_apply(localPatches, remoteContent);
+                targetContent = merged;
+                if (targetContent===remoteContent) { return remoteContent; }
+            }
+
             let currentPos = 0;
-            const op = dmp.diff_main(remoteContent, content).map(part => {
+            const op = dmp.diff_main(remoteContent, targetContent).map(part => {
                 // diff-match-patch can emit empty edit components around
                 // Unicode boundaries. ShareJS rejects {i:""} and {d:""} as
                 // invalid OT arguments.
@@ -508,7 +520,7 @@ export class SocketIOAPI {
             const hash = require('crypto').createHash('sha1').update(
                 // Overleaf's ShareJS compatibility layer hashes the JavaScript
                 // string length used by its text OT model.
-                `blob ${content.length}\x00${content}`
+                `blob ${targetContent.length}\x00${targetContent}`
             ).digest('hex');
             await emit(socket, 'applyOtUpdate', docId, {doc:docId, v:version, hash, op});
 
@@ -519,9 +531,10 @@ export class SocketIOAPI {
             const verified = await emit(verificationSocket, 'joinDoc', docId, {encodeRanges:true});
             const verifiedContent = (verified[0] as string[])
                 .map(line => decodePackedUtf8(line)).join('\n');
-            if (verifiedContent!==content) {
+            if (verifiedContent!==targetContent) {
                 throw new Error('Overleaf rejected or did not commit the document update');
             }
+            return targetContent;
         } finally {
             for (const currentSocket of [socket, verificationSocket]) {
                 try {

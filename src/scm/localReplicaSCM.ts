@@ -397,8 +397,18 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                 this.baseCache[relPath] = newContent;
                                 return;
                             }
-                            if (await this.vfs.writeFileFromLocalReplica(toUri, newContent)) {
-                                this.baseCache[relPath] = newContent;
+                            const pushed = await this.vfs.writeFileFromLocalReplica(
+                                toUri, newContent, this.baseCache[relPath],
+                            );
+                            if (pushed) {
+                                this.baseCache[relPath] = pushed;
+                                if (hashCode(pushed)!==hashCode(newContent)) {
+                                    // The push merged in a concurrent Overleaf edit
+                                    // instead of overwriting it; reflect that merged
+                                    // result locally so the next diff has the right base.
+                                    this.setBypassCache(relPath, pushed);
+                                    await this.writeFile(relPath, pushed);
+                                }
                                 return;
                             }
                             try {

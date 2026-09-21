@@ -62,6 +62,18 @@ Base version: [`overleaf-workshop/overleaf-workshop` v0.15.10](https://github.co
   or failed local push silently discarded any concurrent Overleaf edit to the
   same file, so it never reached the local replica or the next push's base
   content.
+- Merge a local-replica push against the current remote document instead of
+  overwriting it with a plain two-way diff. `writeLocalReplicaDocument`
+  previously computed `diff(remoteContent, localContent)` and applied that
+  as the OT update, which deletes any remote-only text as a byproduct
+  whenever the local file's content predates a concurrent Overleaf edit —
+  true even with no timing race, since the diff has no notion of a shared
+  base. It now takes the local replica's last known base snapshot, and when
+  the remote has moved on from that base, replays only the local delta onto
+  the live remote text (three-way merge, same technique as the manual
+  "Sync Files" `overwrite()` command) before diffing and pushing. The merged
+  result is also written back to the local file so the on-disk replica and
+  cached base stay consistent with what was actually pushed.
 
 ## Build
 

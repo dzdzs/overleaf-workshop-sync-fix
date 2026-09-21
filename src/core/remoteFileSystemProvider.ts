@@ -711,13 +711,14 @@ export class VirtualFileSystem extends vscode.Disposable {
      * connection. This keeps background synchronization independent from a
      * stale editor socket while preserving the authenticated HTTP session.
      */
-    async writeFileFromLocalReplica(uri: vscode.Uri, content:Uint8Array): Promise<boolean> {
+    async writeFileFromLocalReplica(uri: vscode.Uri, content:Uint8Array, baseContent?:Uint8Array): Promise<Uint8Array|false> {
         if (!this.cachedRoot) { return false; }
         const {fileType, fileEntity} = this._resolveUriFromRoot(uri, this.cachedRoot);
         if (fileType!=='doc' || !fileEntity) { return false; }
-        await this.socket.writeLocalReplicaDocument(
+        const finalContent = await this.socket.writeLocalReplicaDocument(
             fileEntity._id,
             new TextDecoder().decode(content),
+            baseContent!==undefined ? new TextDecoder().decode(baseContent) : undefined,
         );
         const doc = fileEntity as DocumentEntity;
         doc.version = undefined;
@@ -725,7 +726,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         doc.localCache = undefined;
         doc.remoteCache = undefined;
         this.notify([{type:vscode.FileChangeType.Changed, uri}]);
-        return true;
+        return new TextEncoder().encode(finalContent);
     }
 
     async refreshLinkedFile(uri: vscode.Uri) {
